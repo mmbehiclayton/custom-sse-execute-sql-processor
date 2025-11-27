@@ -505,25 +505,28 @@ public class SseExecuteSQL extends AbstractExecuteSQL {
             // **IMPORTANT**: We can't call super.onTrigger() because we already retrieved the FlowFile
             // Instead, we need to process the FlowFile ourselves and transfer it properly
             
-            // Execute the SQL query using the target DBCP service
-            try {
-                // Get the SQL query from the processor properties
-                String sqlQuery = context.getProperty(SQL_SELECT_QUERY).getValue();
-                if (sqlQuery == null || sqlQuery.trim().isEmpty()) {
-                    getLogger().error("SQL SELECT query is not configured");
-                    flowFile = session.putAttribute(flowFile, "executesql.error", "SQL SELECT query is not configured");
-                    session.transfer(flowFile, REL_FAILURE);
-                    return;
-                }
-                
-                // Execute the SQL query
-                executeSqlQuery(session, context, flowFile, targetDbcp, sqlQuery);
-                
-            } catch (Exception e) {
-                getLogger().error("ExecuteSQL processing failed after validation: {}", e.getMessage(), e);
-                flowFile = session.putAttribute(flowFile, "executesql.error", e.getMessage());
+            // Get the SQL query from the processor properties (evaluate EL against FlowFile)
+            String sqlQuery = context.getProperty(SQL_SELECT_QUERY)
+                .evaluateAttributeExpressions(flowFile)
+                .getValue();
+            if (sqlQuery == null || sqlQuery.trim().isEmpty()) {
+                getLogger().error("SQL SELECT query is not configured");
+                flowFile = session.putAttribute(flowFile, "executesql.error", "SQL SELECT query is not configured");
                 session.transfer(flowFile, REL_FAILURE);
+                return;
             }
+            
+            // Normalize: some drivers reject trailing semicolons; remove a single trailing ';' if present
+            String normalizedSql = sqlQuery.trim();
+            if (normalizedSql.endsWith(";")) {
+                normalizedSql = normalizedSql.substring(0, normalizedSql.length() - 1).trim();
+            }
+            
+            // Helpful debug logging to diagnose driver parse errors (e.g., SQL92 token position)
+            getLogger().debug("Executing SQL (length={}): {}", normalizedSql.length(), normalizedSql);
+            
+            // Execute the SQL query - this method handles all exceptions and transfers the FlowFile
+            executeSqlQuery(session, context, flowFile, targetDbcp, normalizedSql);
             
         } catch (Exception e) {
             // Step 6: Handle any unexpected errors during validation
@@ -596,12 +599,14 @@ public class SseExecuteSQL extends AbstractExecuteSQL {
         String sourceHost;         // Hostname/IP of source database
         Integer sourcePort;         // Port number of source database
         String sourceDatabase;     // Database name of source database
+        Boolean sourceIsSid;       // Whether source database uses SID (Oracle only)
         
         // Target database configuration
         String targetDbType;       // Database type (mysql, postgresql, oracle, sqlserver)
         String targetHost;         // Hostname/IP of target database
         Integer targetPort;         // Port number of target database
         String targetDatabase;     // Database name of target database
+        Boolean targetIsSid;       // Whether target database uses SID (Oracle only)
     }
 
     /**
@@ -665,14 +670,16 @@ public class SseExecuteSQL extends AbstractExecuteSQL {
             envConfig.sourceDbType,
             envConfig.sourceHost,
             envConfig.sourcePort,
-            envConfig.sourceDatabase
+            envConfig.sourceDatabase,
+            envConfig.sourceIsSid != null ? envConfig.sourceIsSid : false
         );
         
         String expectedTargetUrl = buildJdbcUrl(
             envConfig.targetDbType,
             envConfig.targetHost,
             envConfig.targetPort,
-            envConfig.targetDatabase
+            envConfig.targetDatabase,
+            envConfig.targetIsSid != null ? envConfig.targetIsSid : false
         );
         
         // Log URLs for debugging (at debug level to avoid cluttering logs)
@@ -748,13 +755,15 @@ public class SseExecuteSQL extends AbstractExecuteSQL {
                     sc.port as source_port,
                     sc.db_name as source_database,
                     sc.name as source_name,
+                    sc.is_sid as source_is_sid,
                     -- Target configuration details
                     tc.id as target_config_id,
                     tc.database_type as target_db_type,
                     tc.host as target_host,
                     tc.port as target_port,
                     tc.db_name as target_database,
-                    tc.name as target_name
+                    tc.name as target_name,
+                    tc.is_sid as target_is_sid
                 FROM operations o
                 INNER JOIN environment_configurations e ON o.environment_id = e.id
                 INNER JOIN database_configurations sc ON e.source_config_id = sc.id AND sc.deleted = FALSE
@@ -788,12 +797,18 @@ public class SseExecuteSQL extends AbstractExecuteSQL {
             config.sourceHost = rs.getString("source_host");
             config.sourcePort = rs.getInt("source_port");
             config.sourceDatabase = rs.getString("source_database");
+            // Handle is_sid - can be null, so check for null and default to false
+            int sourceIsSidInt = rs.getInt("source_is_sid");
+            config.sourceIsSid = rs.wasNull() ? false : (sourceIsSidInt != 0);
             
             // Target database configuration
             config.targetDbType = rs.getString("target_db_type");
             config.targetHost = rs.getString("target_host");
             config.targetPort = rs.getInt("target_port");
             config.targetDatabase = rs.getString("target_database");
+            // Handle is_sid - can be null, so check for null and default to false
+            int targetIsSidInt = rs.getInt("target_is_sid");
+            config.targetIsSid = rs.wasNull() ? false : (targetIsSidInt != 0);
             
             getLogger().info("Retrieved environment configuration: {} (ID: {})", 
                 config.environmentName, config.environmentId);
@@ -861,7 +876,7 @@ public class SseExecuteSQL extends AbstractExecuteSQL {
      * Builds JDBC URL using the same logic as EnvironmentConnectionPoolController.
      * 
      * This method creates JDBC URLs in the standard format for different database types:
-     * - Oracle: jdbc:oracle:thin:@host:port/database
+     * - Oracle: jdbc:oracle:thin:@host:port/database (service name) or jdbc:oracle:thin:@host:port:database (SID)
      * - PostgreSQL: jdbc:postgresql://host:port/database
      * - MySQL: jdbc:mysql://host:port/database
      * - SQL Server: jdbc:sqlserver://host:port;databaseName=database
@@ -870,13 +885,21 @@ public class SseExecuteSQL extends AbstractExecuteSQL {
      * @param host Hostname or IP address
      * @param port Port number
      * @param database Database name
+     * @param isSid Whether the database uses SID (Oracle only, true = use :, false = use /)
      * @return Formatted JDBC URL
      * @throws IllegalArgumentException if database type is not supported
      */
-    private String buildJdbcUrl(String dbType, String host, int port, String database) {
+    private String buildJdbcUrl(String dbType, String host, int port, String database, boolean isSid) {
         // Use switch expression (Java 14+ feature) to build URL based on database type
         String baseUrl = switch (dbType.toLowerCase()) {
-            case "oracle" -> "jdbc:oracle:thin:@%s:%d/%s";
+            case "oracle" -> {
+                // Oracle: use ":" for SID, "/" for service name
+                if (isSid) {
+                    yield "jdbc:oracle:thin:@%s:%d:%s";
+                } else {
+                    yield "jdbc:oracle:thin:@%s:%d/%s";
+                }
+            }
             case "postgresql" -> "jdbc:postgresql://%s:%d/%s";
             case "mysql" -> "jdbc:mysql://%s:%d/%s";
             case "sqlserver" -> "jdbc:sqlserver://%s:%d;databaseName=%s";
@@ -949,16 +972,16 @@ public class SseExecuteSQL extends AbstractExecuteSQL {
     /**
      * Executes the SQL query using the provided DBCP service.
      * This method handles the actual SQL execution and result processing.
+     * The FlowFile is ALWAYS transferred (to either REL_SUCCESS or REL_FAILURE) before this method returns.
      * 
      * @param session The process session
      * @param context The process context
      * @param flowFile The FlowFile to process
      * @param dbcpService The DBCP service to use for database connection
      * @param sqlQuery The SQL query to execute
-     * @throws ProcessException if there's an error during SQL execution
      */
     private void executeSqlQuery(ProcessSession session, ProcessContext context, FlowFile flowFile, 
-                                DBCPService dbcpService, String sqlQuery) throws ProcessException {
+                                DBCPService dbcpService, String sqlQuery) {
         
         Connection conn = null;
         PreparedStatement stmt = null;
@@ -993,10 +1016,11 @@ public class SseExecuteSQL extends AbstractExecuteSQL {
                 getLogger().error("Error writing result set: {}", e.getMessage(), e);
                 flowFile = session.putAttribute(flowFile, "executesql.error", "Error writing result set: " + e.getMessage());
                 session.transfer(flowFile, REL_FAILURE);
-                return;
             }
             
-        } catch (SQLException e) {
+        } catch (Exception e) {
+            // Catch ALL exceptions (SQLException, ProcessException, RuntimeException, etc.)
+            // and ensure FlowFile is transferred to failure
             getLogger().error("SQL execution failed: {}", e.getMessage(), e);
             flowFile = session.putAttribute(flowFile, "executesql.error", e.getMessage());
             session.transfer(flowFile, REL_FAILURE);
