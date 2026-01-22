@@ -47,7 +47,9 @@ import org.apache.nifi.util.db.JdbcCommon;
 import java.util.List;
 import java.util.Set;
 import java.sql.*;
+import java.io.IOException;
 import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 
 import static org.apache.nifi.util.db.JdbcProperties.DEFAULT_PRECISION;
 import static org.apache.nifi.util.db.JdbcProperties.DEFAULT_SCALE;
@@ -528,14 +530,32 @@ public class SseExecuteSQL extends AbstractExecuteSQL {
             // the FlowFile
             // Instead, we need to process the FlowFile ourselves and transfer it properly
 
-            // Get the SQL query from the processor properties (evaluate EL against
-            // FlowFile)
+            // Get the SQL query - support both scenarios:
+            // 1. SQL query configured in processor property (static)
+            // 2. SQL query in FlowFile content (dynamic from ExecuteScript)
             String sqlQuery = context.getProperty(SQL_SELECT_QUERY)
                     .evaluateAttributeExpressions(flowFile)
                     .getValue();
+
+            // If SQL query is not in processor property, try reading from FlowFile content
+            // This matches the behavior of normal ExecuteSQL which can read SQL from
+            // content
             if (sqlQuery == null || sqlQuery.trim().isEmpty()) {
-                getLogger().error("SQL SELECT query is not configured");
-                flowFile = session.putAttribute(flowFile, "executesql.error", "SQL SELECT query is not configured");
+                getLogger().debug("SQL query not found in processor property, reading from FlowFile content");
+
+                final StringBuilder sqlBuilder = new StringBuilder();
+                session.read(flowFile, inputStream -> {
+                    sqlBuilder.append(new String(inputStream.readAllBytes(), StandardCharsets.UTF_8));
+                });
+
+                sqlQuery = sqlBuilder.toString();
+            }
+
+            // Final validation - if still no SQL query found, fail
+            if (sqlQuery == null || sqlQuery.trim().isEmpty()) {
+                getLogger().error("SQL SELECT query is not configured in processor property or FlowFile content");
+                flowFile = session.putAttribute(flowFile, "executesql.error",
+                        "SQL SELECT query is not configured in processor property or FlowFile content");
                 session.transfer(flowFile, REL_FAILURE);
                 return;
             }
@@ -1060,28 +1080,48 @@ public class SseExecuteSQL extends AbstractExecuteSQL {
             stmt = conn.prepareStatement(sqlQuery);
 
             // Execute the query
-            rs = stmt.executeQuery();
+            boolean hasResultSet = stmt.execute(sqlQuery);
 
-            // Configure the SQL writer
-            SqlWriter sqlWriter = configureSqlWriter(session, context, flowFile);
+            if (hasResultSet) {
+                // Scenario 1: Query returned a ResultSet (SELECT)
+                rs = stmt.getResultSet();
 
-            // Process the result set
-            // Write the result set directly to the original FlowFile
-            try (OutputStream out = session.write(flowFile)) {
-                long rowCount = sqlWriter.writeResultSet(rs, out, getLogger(), null);
+                // Configure the SQL writer
+                SqlWriter sqlWriter = configureSqlWriter(session, context, flowFile);
 
-                // Add row count attribute
-                flowFile = session.putAttribute(flowFile, "executesql.row.count", String.valueOf(rowCount));
+                // Process the result set
+                // Write the result set directly to the original FlowFile
+                try (OutputStream out = session.write(flowFile)) {
+                    long rowCount = sqlWriter.writeResultSet(rs, out, getLogger(), null);
+
+                    // Add row count attribute
+                    flowFile = session.putAttribute(flowFile, "executesql.row.count", String.valueOf(rowCount));
+
+                    // Transfer to success relationship
+                    session.transfer(flowFile, REL_SUCCESS);
+
+                    getLogger().info("Successfully executed SQL query, returned {} rows", rowCount);
+                } catch (Exception e) {
+                    getLogger().error("Error writing result set: {}", e.getMessage(), e);
+                    flowFile = session.putAttribute(flowFile, "executesql.error",
+                            "Error writing result set: " + e.getMessage());
+                    session.transfer(flowFile, REL_FAILURE);
+                }
+            } else {
+                // Scenario 2: Query did not return a ResultSet (INSERT, UPDATE, DELETE, DDL)
+                int updateCount = stmt.getUpdateCount();
+
+                // Clear the FlowFile content as there is no result set
+                flowFile = session.write(flowFile, out -> {
+                });
+
+                // Add row count attribute (update count)
+                flowFile = session.putAttribute(flowFile, "executesql.row.count", String.valueOf(updateCount));
 
                 // Transfer to success relationship
                 session.transfer(flowFile, REL_SUCCESS);
 
-                getLogger().info("Successfully executed SQL query, returned {} rows", rowCount);
-            } catch (Exception e) {
-                getLogger().error("Error writing result set: {}", e.getMessage(), e);
-                flowFile = session.putAttribute(flowFile, "executesql.error",
-                        "Error writing result set: " + e.getMessage());
-                session.transfer(flowFile, REL_FAILURE);
+                getLogger().info("Successfully executed SQL update, affected {} rows", updateCount);
             }
 
         } catch (Exception e) {

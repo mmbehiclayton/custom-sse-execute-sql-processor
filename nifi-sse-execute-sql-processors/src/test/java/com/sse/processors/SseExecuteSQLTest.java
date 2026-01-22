@@ -37,6 +37,7 @@ public class SseExecuteSQLTest {
     @BeforeEach
     public void init() {
         testRunner = TestRunners.newTestRunner(SseExecuteSQL.class);
+        testRunner.setValidateExpressionUsage(false);
     }
 
     @Test

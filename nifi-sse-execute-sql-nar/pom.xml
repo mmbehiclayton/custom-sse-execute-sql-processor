@@ -49,6 +49,7 @@
         <dependency>
             <groupId>org.apache.nifi</groupId>
             <artifactId>nifi-standard-processors</artifactId>
+            <version>${nifi.version}</version>
             <scope>provided</scope>
         </dependency>
         
@@ -56,6 +57,7 @@
         <dependency>
             <groupId>org.apache.nifi</groupId>
             <artifactId>nifi-database-utils</artifactId>
+            <version>${nifi.version}</version>
             <scope>provided</scope>
         </dependency>
     </dependencies>
@@ -68,8 +70,6 @@
                 <artifactId>nifi-nar-maven-plugin</artifactId>
                 <extensions>true</extensions>
                 <configuration>
-                    <!-- Skip documentation generation if it fails -->
-                    <skipDocumentationGeneration>false</skipDocumentationGeneration>
                     <!-- Include all dependencies -->
                     <includeDependencies>true</includeDependencies>
                 </configuration>
